@@ -13,6 +13,9 @@ from datasets import Dataset
 from deepspeed import DeepSpeedEngine
 from transformers import AutoTokenizer, PreTrainedModel
 from vllm import LLM, SamplingParams
+from vllm.inputs import TokensPrompt
+
+from vllm_utils import * 
 
 DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant. You first think about the reasoning process in the mind and then provide the user with the answer."
 DEFAULT_PROMPT_TEMPLATE = "Using the numbers {numbers}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. And return the final equation and answer in <answer> </answer> tags, for example <answer>(1 + 2) / (3 * 5)</answer>."
@@ -251,8 +254,10 @@ def evaluate_on_test_set(
         ... )
         >>> print(f"Average reward: {episodes_stats['rewards']:.3f}")
     """
+
+    requests = [TokensPrompt(prompt_token_ids = r) for r in list(test_dataset["input_ids"])]
     generations = inference_engine.generate(
-        prompt_token_ids=test_dataset["input_ids"], sampling_params=eval_sampling_params
+        requests, eval_sampling_params
     )
 
     metrics = {
@@ -370,7 +375,9 @@ def find_last_checkpoint(exp_dir: Path) -> Tuple[Optional[Path], Optional[int]]:
     return ckpt_path, ckpt_iter
 
 
-def load_model_into_vllm(model: Union[DeepSpeedEngine, PreTrainedModel], llm: LLM) -> None:
+
+
+def load_model_into_vllm(model: Union[DeepSpeedEngine, PreTrainedModel], communicator, llm: LLM) -> None:
     """
     Load weights from a HuggingFace model (either wrapped in DeepSpeed or not) into a vLLM inference engine.
 
@@ -386,8 +393,17 @@ def load_model_into_vllm(model: Union[DeepSpeedEngine, PreTrainedModel], llm: LL
     Returns:
         None
     """
-    state_dict = model.module.state_dict() if isinstance(model, DeepSpeedEngine) else model.state_dict()
-    llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(state_dict.items())
+
+    for name, p in model.named_parameters():
+        dtype_name = str(p.dtype).split(".")[-1]
+        handle = llm.collective_rpc(
+            "update_weight", args=(name, dtype_name, p.shape)
+        )
+        communicator.broadcast(p, src=0, stream=torch.cuda.current_stream())
+
+    # outdated vllm method of loading weights into inference engine: 
+    # state_dict = model.module.state_dict() if isinstance(model, DeepSpeedEngine) else model.state_dict()
+    # llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(state_dict.items())
 
 
 def initialize_training_process_group(rank: int, world_size: int):
