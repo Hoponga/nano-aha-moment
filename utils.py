@@ -14,6 +14,7 @@ from deepspeed import DeepSpeedEngine
 from transformers import AutoTokenizer, PreTrainedModel
 from vllm import LLM, SamplingParams
 from vllm.inputs import TokensPrompt
+import ray 
 
 from vllm_utils import * 
 
@@ -256,9 +257,9 @@ def evaluate_on_test_set(
     """
 
     requests = [TokensPrompt(prompt_token_ids = r) for r in list(test_dataset["input_ids"])]
-    generations = inference_engine.generate(
+    generations = ray.get(inference_engine.generate.remote(
         requests, eval_sampling_params
-    )
+    ))
 
     metrics = {
         "response_lengths": [],
@@ -396,10 +397,14 @@ def load_model_into_vllm(model: Union[DeepSpeedEngine, PreTrainedModel], communi
 
     for name, p in model.named_parameters():
         dtype_name = str(p.dtype).split(".")[-1]
-        handle = llm.collective_rpc(
+        if "module" in name:
+            name = name.replace("module.", "")
+
+        handle = llm.collective_rpc.remote(
             "update_weight", args=(name, dtype_name, p.shape)
         )
         communicator.broadcast(p, src=0, stream=torch.cuda.current_stream())
+        ray.get(handle)
 
     # outdated vllm method of loading weights into inference engine: 
     # state_dict = model.module.state_dict() if isinstance(model, DeepSpeedEngine) else model.state_dict()
@@ -519,7 +524,7 @@ def fix_oov_logits_processor(inference_engine: LLM):
     # So we mask them using process_token
     # fix_oov # remove asap when this is fixed in vllm, it is dirty and even logit processors are not supported in engine v1 of vllm
 
-    tokenizer_vocab_size = len(inference_engine.get_tokenizer().get_vocab())
+    tokenizer_vocab_size = len(ray.get(inference_engine.get_tokenizer.remote()).get_vocab())
 
     def fix_oov(token_ids, logits):
         logits[tokenizer_vocab_size:] = -float("inf")
